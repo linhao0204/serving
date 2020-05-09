@@ -28,6 +28,24 @@ py_test(
     srcs_version = "PY2AND3",
     deps = [
         ":doc_generator_visitor",
+        ":generate_lib",
+        "//tensorflow/python:platform_test",
+    ],
+)
+
+py_library(
+    name = "doc_controls",
+    srcs = ["doc_controls.py"],
+    srcs_version = "PY2AND3",
+)
+
+py_test(
+    name = "doc_controls_test",
+    size = "small",
+    srcs = ["doc_controls_test.py"],
+    srcs_version = "PY2AND3",
+    deps = [
+        ":doc_controls",
         "//tensorflow/python:platform_test",
     ],
 )
@@ -37,6 +55,12 @@ py_library(
     srcs = ["parser.py"],
     srcs_version = "PY2AND3",
     visibility = ["//visibility:public"],
+    deps = [
+        ":doc_controls",
+        "//tensorflow/python:platform",
+        "//tensorflow/python:util",
+        "@astor_archive//:astor",
+    ],
 )
 
 py_test(
@@ -44,7 +68,6 @@ py_test(
     size = "small",
     srcs = ["parser_test.py"],
     srcs_version = "PY2AND3",
-    tags = ["manual"],
     deps = [
         ":parser",
         "//tensorflow/python:platform_test",
@@ -63,6 +86,7 @@ py_binary(
     srcs_version = "PY2AND3",
     visibility = ["//visibility:public"],
     deps = [
+        ":doc_controls",
         ":doc_generator_visitor",
         ":parser",
         ":pretty_docs",
@@ -78,13 +102,10 @@ py_test(
     size = "small",
     srcs = ["generate_lib_test.py"],
     srcs_version = "PY2AND3",
-    tags = ["manual"],
     deps = [
         ":generate_lib",
         ":parser",
-        "//tensorflow:tensorflow_py",
         "//tensorflow/python:platform_test",
-        "//tensorflow/python/debug:debug_py",
     ],
 )
 
@@ -92,6 +113,27 @@ py_binary(
     name = "generate",
     srcs = ["generate.py"],
     srcs_version = "PY2AND3",
+    deps = [
+        ":generate_lib",
+        "//tensorflow:tensorflow_py",
+        "//tensorflow/python:util",
+        "//tensorflow/python/debug:debug_py",
+    ],
+)
+
+py_test(
+    name = "build_docs_test",
+    size = "small",
+    srcs = ["build_docs_test.py"],
+    data = ["//tensorflow/docs_src"],
+    srcs_version = "PY2AND3",
+    tags = [
+        # No reason to run sanitizers or fastbuild for this test.
+        "noasan",
+        "nomsan",
+        "notsan",
+        "optonly",
+    ],
     deps = [
         ":generate_lib",
         "//tensorflow:tensorflow_py",
@@ -125,15 +167,4 @@ py_test(
         ":py_guide_parser",
         "//tensorflow/python:client_testlib",
     ],
-)
-
-filegroup(
-    name = "all_files",
-    srcs = glob(
-        ["**/*"],
-        exclude = [
-            "**/METADATA",
-            "**/OWNERS",
-        ],
-    ),
 )

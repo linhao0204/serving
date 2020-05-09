@@ -13,8 +13,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#ifndef TENSORFLOW_GRAPPLER_DEVICES_H_
-#define TENSORFLOW_GRAPPLER_DEVICES_H_
+#ifndef TENSORFLOW_CORE_GRAPPLER_DEVICES_H_
+#define TENSORFLOW_CORE_GRAPPLER_DEVICES_H_
 
 #include <functional>
 
@@ -29,10 +29,14 @@ namespace grappler {
 // than 8.
 int GetNumAvailableGPUs();
 
+// Maximum amount of gpu memory available per gpu. gpu_id must be in the range
+// [0, num_available_gpu)
+int64 AvailableGPUMemory(int gpu_id);
+
 // Get the number of logical CPU cores (aka hyperthreads) available.
 int GetNumAvailableLogicalCPUCores();
 
 }  // end namespace grappler
 }  // end namespace tensorflow
 
-#endif  // TENSORFLOW_GRAPPLER_DEVICES_H_
+#endif  // TENSORFLOW_CORE_GRAPPLER_DEVICES_H_

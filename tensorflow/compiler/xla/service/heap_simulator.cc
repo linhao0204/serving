@@ -18,8 +18,8 @@ limitations under the License.
 #include <algorithm>
 #include <vector>
 
+#include "absl/memory/memory.h"
 #include "tensorflow/compiler/xla/map_util.h"
-#include "tensorflow/compiler/xla/service/liveness_util.h"
 #include "tensorflow/compiler/xla/util.h"
 
 namespace xla {
@@ -27,38 +27,84 @@ namespace xla {
 using tensorflow::gtl::FlatMap;
 using tensorflow::gtl::FlatSet;
 
-namespace {
-
-// Returns the set of buffers that may be sources of all operands of the given
-// instruction.  The returned buffers are guaranteed to have no duplicates, and
-// to be sorted in a deterministic order.
-std::vector<const LogicalBuffer*> UniqueOperandSourceBuffers(
-    const HloInstruction* instruction,
-    const TuplePointsToAnalysis& points_to_analysis) {
-  FlatSet<const LogicalBuffer*> buffers;
-  for (const HloInstruction* operand : instruction->operands()) {
-    FlatSet<const LogicalBuffer*> sources =
-        points_to_analysis.GetPointsToSet(operand).CreateFlattenedSet();
-    buffers.insert(sources.begin(), sources.end());
+/*static*/
+StatusOr<int64> HeapSimulator::MinimumMemoryForModule(
+    const SequentialHloOrdering::HloModuleSequence& module_sequence,
+    const LogicalBuffer::SizeFunction& size_function) {
+  if (module_sequence.empty()) {
+    return 0;
   }
-  std::vector<const LogicalBuffer*> sorted(buffers.begin(), buffers.end());
-  std::sort(sorted.begin(), sorted.end(),
-            [](const LogicalBuffer* a, const LogicalBuffer* b) {
-              return a->id() < b->id();
-            });
-  return sorted;
+
+  const HloModule* module = module_sequence.begin()->first->parent();
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<TuplePointsToAnalysis> points_to_analysis,
+                      TuplePointsToAnalysis::Run(module));
+
+  // The absolute minimum memory required for a given sequence of instructions
+  // is determined by the sequence of Alloc and Free calls on a simulated heap,
+  // ignoring fragmentation. We run the heap simulation on the whole module,
+  // rather than summing each computation, since it gives us a better lower
+  // bound, by minimizing the liveness of sub-computations.
+  TF_ASSIGN_OR_RETURN(
+      HeapSimulator::Result result,
+      HeapSimulator::Run(absl::make_unique<NoFragmentationStatsHeap>(), *module,
+                         module_sequence, *points_to_analysis, size_function));
+  return result.heap_size;
 }
 
-}  // namespace
+/*static*/
+StatusOr<int64> HeapSimulator::MinimumMemoryForComputation(
+    const HloComputation& computation,
+    const std::vector<const HloInstruction*>& sequence,
+    const TuplePointsToAnalysis& points_to_analysis,
+    const LogicalBuffer::SizeFunction& size_function,
+    const tensorflow::gtl::FlatMap<const HloComputation*, int64>*
+        memory_by_computation) {
+  TF_ASSIGN_OR_RETURN(
+      HeapSimulator::Result result,
+      HeapSimulator::Run(absl::make_unique<NoFragmentationStatsHeap>(),
+                         computation, sequence, points_to_analysis,
+                         size_function, HeapSimulator::Options(),
+                         memory_by_computation));
+  return result.heap_size;
+}
 
 /*static*/
 StatusOr<HeapSimulator::Result> HeapSimulator::Run(
-    std::unique_ptr<HeapAlgorithm> algorithm,
-    const std::vector<const HloInstruction*>& instruction_sequence,
-    const HloComputation& computation,
+    std::unique_ptr<HeapAlgorithm> algorithm, const HloModule& module,
+    const SequentialHloOrdering::HloModuleSequence& module_sequence,
     const TuplePointsToAnalysis& points_to_analysis,
-    const LogicalBuffer::SizeFunction& size_fn,
-    const FlatSet<const LogicalBuffer*>* buffers_to_assign) {
+    const BufferValue::SizeFunction& size_fn, const Options& options) {
+  HeapSimulator heap(std::move(algorithm), size_fn, options, &module_sequence);
+  const HloComputation* entry_computation = module.entry_computation();
+  const std::vector<const HloInstruction*>& instruction_sequence =
+      FindOrDie(module_sequence, entry_computation);
+  TF_RETURN_IF_ERROR(heap.RunComputation(
+      *entry_computation, instruction_sequence, points_to_analysis));
+  return heap.Finish();
+}
+
+/*static*/
+StatusOr<HeapSimulator::Result> HeapSimulator::Run(
+    std::unique_ptr<HeapAlgorithm> algorithm, const HloComputation& computation,
+    const std::vector<const HloInstruction*>& instruction_sequence,
+    const TuplePointsToAnalysis& points_to_analysis,
+    const BufferValue::SizeFunction& size_fn, const Options& options,
+    const tensorflow::gtl::FlatMap<const HloComputation*, int64>*
+        memory_by_computation) {
+  HeapSimulator heap(std::move(algorithm), size_fn, options,
+                     /*module_sequence=*/nullptr, memory_by_computation);
+  TF_RETURN_IF_ERROR(heap.RunComputation(computation, instruction_sequence,
+                                         points_to_analysis));
+  return heap.Finish();
+}
+
+// Runs a heap simulation for the given 'computation', assuming the given
+// 'instruction_sequence'.
+Status HeapSimulator::RunComputation(
+    const HloComputation& computation,
+    const std::vector<const HloInstruction*>& instruction_sequence,
+    const TuplePointsToAnalysis& points_to_analysis) {
+  VLOG(3) << "Computation:\n" << computation.ToString();
   // The goal here is to minimize memory usage, assuming the given sequential
   // ordering of instructions.  The strategy is to walk through the instruction
   // sequence, calling Alloc and Free on the underlying heap algorithm.  The
@@ -67,36 +113,75 @@ StatusOr<HeapSimulator::Result> HeapSimulator::Run(
   // 'live_buffers' tracks the liveness of each buffer that we assign, by
   // associating it with a set of HloInstructions that need to be visited.  When
   // the set becomes empty, the buffer is no longer used, and can be freed.
-  HeapSimulator heap(std::move(algorithm), size_fn, buffers_to_assign);
-  FlatMap<const LogicalBuffer*, FlatSet<const HloInstruction*>> live_buffers;
+  // 'used_buffers' is the reverse map - it tracks which buffers were used by an
+  // instruction, so that we can remove the instructions from a buffer's live
+  // set after they are visited.
+  FlatMap<const BufferValue*, FlatSet<const HloInstruction*>> live_buffers;
+  FlatMap<const HloInstruction*, FlatSet<const BufferValue*>> used_buffers;
+  auto add_user_to_buffer = [this, &live_buffers, &used_buffers](
+                                const HloInstruction* user,
+                                const BufferValue* buffer) {
+    if (!IgnoreBuffer(buffer)) {
+      VLOG(4) << "  Adding user " << user->name() << " to buffer "
+              << buffer->ToString();
+      live_buffers[buffer].insert(user);
+      used_buffers[user].insert(buffer);
+    }
+  };
 
+  // Initialize live_buffers for each buffer that we're going to assign.  The
+  // set of instructions that need to be visited contains all users of all
+  // aliases, that is, all users of all instructions that have the buffer
+  // contained in their points-to set.
   for (const HloInstruction* instruction : instruction_sequence) {
-    const std::vector<const LogicalBuffer*>& buffers_defined_by_instruction =
-        points_to_analysis.GetBuffersDefinedByInstruction(instruction);
-
-    const HloInstruction* root = computation.root_instruction();
-    FlatSet<const LogicalBuffer*> output_source_buffers =
-        points_to_analysis.GetPointsToSet(root).CreateFlattenedSet();
-
-    // Initialize live_buffers for each buffer that we're going to assign.  The
-    // set of instructions that need to be visited contains all users of all
-    // aliases.  The alias itself is not necessary; if it has users, the users
-    // are necessarily scheduled after the alias.  And if it has no users, it is
-    // either a dead value or an output, both of which are handled below.
-    std::vector<const LogicalBuffer*> dead_buffers_to_free;
-    for (const LogicalBuffer* buffer : buffers_defined_by_instruction) {
-      if (heap.IgnoreBuffer(buffer)) {
-        continue;
-      }
-      for (const BufferAlias& alias :
-           points_to_analysis.GetBufferAliases(*buffer)) {
-        const std::vector<HloInstruction*>& users =
-            alias.instruction()->users();
-        if (!users.empty()) {
-          live_buffers[buffer].insert(users.begin(), users.end());
+    const PointsToSet& points_to =
+        points_to_analysis.GetPointsToSet(instruction);
+    const PointsToSet::BufferSet& buffer_set = points_to.CreateFlattenedSet();
+    for (const HloInstruction* user : instruction->users()) {
+      if (user->opcode() != HloOpcode::kGetTupleElement) {
+        for (const BufferValue* buffer : buffer_set) {
+          add_user_to_buffer(user, buffer);
+        }
+      } else {
+        // A GetTupleElement doesn't need to keep all of its operand's buffers
+        // alive. It only needs the buffers that relate to the element it's
+        // extracting, and the tuple it's extracting from, but not the buffers
+        // for the other elements.
+        for (const BufferValue* buffer : points_to.element({})) {
+          add_user_to_buffer(user, buffer);
+        }
+        const PointsToSet& gte_points_to =
+            points_to_analysis.GetPointsToSet(user);
+        for (const BufferValue* buffer : gte_points_to.CreateFlattenedSet()) {
+          add_user_to_buffer(user, buffer);
         }
       }
+    }
+  }
 
+  const HloInstruction* root = computation.root_instruction();
+  BufferValueCompactPointerSet output_source_buffers =
+      ToBufferValueCompactPointerSet(
+          points_to_analysis.GetPointsToSet(root).CreateFlattenedSet());
+
+  std::vector<const BufferValue*> dead_buffers_to_free;
+  std::vector<const BufferValue*> operand_buffers_to_free;
+  for (const HloInstruction* instruction : instruction_sequence) {
+    const TuplePointsToAnalysis::BufferDefinitionVector&
+        buffers_defined_by_instruction =
+            points_to_analysis.GetBuffersDefinedByInstruction(instruction);
+
+    VLOG(3) << "Instruction: " << instruction->ToString();
+    for (const BufferValue* buffer : buffers_defined_by_instruction) {
+      VLOG(4) << "  Defines: " << buffer->ToString()
+              << (IgnoreBuffer(buffer) ? " (Ignored)" : "");
+    }
+
+    dead_buffers_to_free.clear();
+    for (const BufferValue* buffer : buffers_defined_by_instruction) {
+      if (IgnoreBuffer(buffer)) {
+        continue;
+      }
       // Add a nullptr sentry to ensure entry parameters and output source
       // buffers are not freed until the very end.
       const bool entry_parameter =
@@ -119,28 +204,39 @@ StatusOr<HeapSimulator::Result> HeapSimulator::Run(
     // all source buffers of all operands of this instruction.  Buffers that
     // have no instructions left to visit are moved from live_buffers to
     // operand_buffers_to_free.
-    std::vector<const LogicalBuffer*> operand_buffers_to_free;
-    for (const LogicalBuffer* operand_buffer :
-         UniqueOperandSourceBuffers(instruction, points_to_analysis)) {
-      if (heap.IgnoreBuffer(operand_buffer)) {
+    operand_buffers_to_free.clear();
+    for (const BufferValue* operand_buffer : used_buffers[instruction]) {
+      if (IgnoreBuffer(operand_buffer)) {
         continue;
       }
-      live_buffers[operand_buffer].erase(instruction);
-      if (live_buffers[operand_buffer].empty()) {
-        live_buffers.erase(operand_buffer);
+      VLOG(4) << "  Removing user " << instruction->name() << " from buffer "
+              << operand_buffer->ToString();
+      auto it = live_buffers.find(operand_buffer);
+      FlatSet<const HloInstruction*>* live_set = &it->second;
+      live_set->erase(instruction);
+      if (live_set->empty()) {
+        live_buffers.erase(it);
         operand_buffers_to_free.push_back(operand_buffer);
       }
     }
+    // Sort to get a deterministic iteration order.
+    std::sort(operand_buffers_to_free.begin(), operand_buffers_to_free.end(),
+              [](const BufferValue* x, const BufferValue* y) {
+                return x->id() < y->id();
+              });
 
     // Allocate buffers defined by this instruction.  This is the latest point
     // that we can allocate; right before the buffer is first used.  This must
     // happen before dead or operand buffers are freed; the instruction reads
     // the operand buffers to produce its output.
     //
-    // INVARIANT: Either heap.Alloc or heap.ShareBuffer will be called for each
-    // buffer that we should assign.
-    for (const LogicalBuffer* buffer : buffers_defined_by_instruction) {
-      if (heap.IgnoreBuffer(buffer)) {
+    // INVARIANT: Either Alloc or ShareBuffer will be called for each buffer
+    // that we should assign.
+
+    // Make sure each buffer get reused at most once.
+    FlatSet<const BufferValue*> reused_buffers;
+    for (const BufferValue* buffer : buffers_defined_by_instruction) {
+      if (IgnoreBuffer(buffer)) {
         continue;
       }
 
@@ -149,68 +245,134 @@ StatusOr<HeapSimulator::Result> HeapSimulator::Run(
       // We can only share with the operand buffer if it is about to be freed;
       // we must be the last user of the buffer.
       bool shared = false;
-      for (const LogicalBuffer* operand_buffer : operand_buffers_to_free) {
-        if (buffer->instruction()->IsUserOf(operand_buffer->instruction()) &&
-            CanShareOperandBufferWithUser(
-                operand_buffer->instruction(), operand_buffer->index(),
-                buffer->instruction(), buffer->index(), points_to_analysis)) {
-          heap.ShareBuffer(buffer, operand_buffer);
-          shared = true;
-          break;
+      if (options_.may_reuse_operand_buffers) {
+        for (const BufferValue* operand_buffer : operand_buffers_to_free) {
+          if (reused_buffers.count(operand_buffer) != 0) {
+            continue;
+          }
+          if (buffer->instruction()->IsUserOf(operand_buffer->instruction()) &&
+              buffer->instruction()->opcode() != HloOpcode::kCopy &&
+              points_to_analysis.CanShareOperandBufferWithUser(
+                  operand_buffer->instruction(), operand_buffer->index(),
+                  buffer->instruction(), buffer->index())) {
+            VLOG(3) << "  Sharing: " << buffer->ToString() << " with "
+                    << operand_buffer->ToString();
+            ShareBuffer(buffer, operand_buffer, instruction);
+            shared = true;
+            reused_buffers.insert(operand_buffer);
+            break;
+          }
         }
       }
 
       if (!shared) {
-        heap.Alloc(buffer);
+        VLOG(3) << "  Allocating: " << buffer->ToString();
+        Alloc(buffer, instruction);
       }
+    }
+    // Account for the memory used by subcomputations when estimating the
+    // current heap size.
+    if (memory_by_computation_ != nullptr) {
+      algorithm_->AccountForSubcomputationMemory(instruction,
+                                                 *memory_by_computation_);
+    }
+
+    // If all computations in the module have been scheduled, we can save memory
+    // by running the heap-simulation for sub-computations inline. E.g. the
+    // buffers for the condition and body of a kWhile instruction are only live
+    // for the duration of the instruction itself.
+    //
+    // The order that the sub-computations are simulated does not affect
+    // correctness; since the whole module has been scheduled, we know that the
+    // sub-computations will never be run concurrently.
+    if (module_sequence_ != nullptr) {
+      if (instruction->opcode() == HloOpcode::kCall ||
+          instruction->opcode() == HloOpcode::kConditional ||
+          instruction->opcode() == HloOpcode::kWhile) {
+        for (const HloComputation* called_computation :
+             instruction->called_computations()) {
+          const std::vector<const HloInstruction*>& called_sequence =
+              FindOrDie(*module_sequence_, called_computation);
+          TF_RETURN_IF_ERROR(RunComputation(
+              *called_computation, called_sequence, points_to_analysis));
+        }
+      }
+
+      // Other sub-computations (e.g. Map, Reduce, ...) are skipped; they are
+      // assigned "thread-local" allocations, meaning their buffers are not
+      // allocated up-front at the beginning of the computation.
     }
 
     // Free buffers that are no longer live.  This is the earliest point that we
     // can de-allocate; right after the last use of the buffer.
-    for (const LogicalBuffer* buffer : dead_buffers_to_free) {
-      heap.Free(buffer);
+    for (const BufferValue* buffer : dead_buffers_to_free) {
+      VLOG(3) << "  Freeing dead: " << buffer->ToString();
+      Free(buffer, instruction);
     }
-    for (const LogicalBuffer* buffer : operand_buffers_to_free) {
-      heap.Free(buffer);
+    for (const BufferValue* buffer : operand_buffers_to_free) {
+      VLOG(3) << "  Freeing operand: " << buffer->ToString();
+      Free(buffer, instruction);
     }
   }
 
   // Any remaining live buffers must be entry parameters or output source
-  // buffers, which had a nullptr sentry added.  Free them now.
+  // buffers, which had a nullptr sentry added.  Free them now, in a
+  // deterministic order.
+  std::vector<const BufferValue*> to_free;
+  to_free.reserve(live_buffers.size());
   for (const auto& buffer_pending : live_buffers) {
-    const LogicalBuffer* buffer = buffer_pending.first;
+    const BufferValue* buffer = buffer_pending.first;
     const FlatSet<const HloInstruction*>& pending = buffer_pending.second;
     CHECK_EQ(pending.size(), 1) << *buffer;
     CHECK(*pending.begin() == nullptr) << *buffer;
-    heap.Free(buffer);
+    to_free.push_back(buffer);
   }
 
-  return heap.Finish();
+  std::sort(to_free.begin(), to_free.end(),
+            [](const BufferValue* x, const BufferValue* y) {
+              return x->id() < y->id();
+            });
+  for (const BufferValue* buffer : to_free) {
+    VLOG(3) << "Freeing pending: " << buffer->ToString();
+    Free(buffer, root);
+  }
+
+  return Status::OK();
 }
 
 HeapSimulator::HeapSimulator(
     std::unique_ptr<HeapAlgorithm> algorithm,
-    const LogicalBuffer::SizeFunction& size_fn,
-    const FlatSet<const LogicalBuffer*>* buffers_to_assign)
-    : no_fragmentation_stats_(MakeUnique<NoFragmentationStatsHeap>()),
+    const BufferValue::SizeFunction& size_fn, const Options& options,
+    const SequentialHloOrdering::HloModuleSequence* module_sequence,
+    const tensorflow::gtl::FlatMap<const HloComputation*, int64>*
+        memory_by_computation)
+    : no_fragmentation_stats_(absl::make_unique<NoFragmentationStatsHeap>()),
       algorithm_(std::move(algorithm)),
       size_fn_(size_fn),
-      buffers_to_assign_(buffers_to_assign) {}
+      options_(options),
+      module_sequence_(module_sequence),
+      memory_by_computation_(memory_by_computation) {
+  debug_trace_.set_whole_module_simulation(module_sequence_ != nullptr);
+}
 
 HeapSimulator::~HeapSimulator() {}
 
-bool HeapSimulator::IgnoreBuffer(const LogicalBuffer* buffer) const {
-  // Buffers for constants are ignored, as with BufferAssigner.  Also ignore
-  // buffers that we're not meant to assign.
+bool HeapSimulator::IgnoreBuffer(const BufferValue* buffer) const {
+  // Buffers for constants are ignored unless the alloc_constants option is
+  // set. Also ignore buffers that we're not meant to assign.
   //
   // TODO(b/32248867): For consistency, constants should get allocations.
-  return buffer->instruction()->opcode() == HloOpcode::kConstant ||
-         (buffers_to_assign_ != nullptr &&
-          buffers_to_assign_->count(buffer) == 0);
+  if (!options_.alloc_constants &&
+      buffer->instruction()->opcode() == HloOpcode::kConstant) {
+    return true;
+  }
+  return options_.buffers_to_assign != nullptr &&
+         options_.buffers_to_assign->count(buffer) == 0;
 }
 
 // Alloc always calls the underlying heap algorithm.
-void HeapSimulator::Alloc(const LogicalBuffer* buffer) {
+void HeapSimulator::Alloc(const BufferValue* buffer,
+                          const HloInstruction* instruction) {
   CHECK(allocated_buffers_.count(buffer) == 0)
       << "Alloc called on allocated buffer: " << *buffer;
   CHECK(freed_buffers_.count(buffer) == 0)
@@ -218,15 +380,20 @@ void HeapSimulator::Alloc(const LogicalBuffer* buffer) {
 
   allocated_buffers_.insert(buffer);
   const int64 size = size_fn_(*buffer);
-  algorithm_->Alloc(buffer, size);
-  no_fragmentation_stats_->Alloc(buffer, size);
+  const HloInstruction* instruction_to_calc_aliasing =
+      memory_by_computation_ == nullptr ? nullptr : instruction;
+  algorithm_->Alloc(buffer, size, instruction_to_calc_aliasing);
+  no_fragmentation_stats_->Alloc(buffer, size, instruction_to_calc_aliasing);
+  FillDebugTrace(HeapSimulatorTrace::Event::ALLOC, buffer, instruction,
+                 nullptr);
 }
 
 // Free calls the underlying algorithm for non-shared buffers, and for shared
 // buffers whose group liveness has expired.  Shared group liveness is tracked
 // by maintaining a refcount; the Free call on the last buffer in the group
 // causes Free to be called on the underlying algorithm.
-void HeapSimulator::Free(const LogicalBuffer* buffer) {
+void HeapSimulator::Free(const BufferValue* buffer,
+                         const HloInstruction* instruction) {
   auto shared_it = shared_buffers_.find(buffer);
   if (shared_it != shared_buffers_.end()) {
     std::shared_ptr<SharedGroup> group = shared_it->second;
@@ -248,14 +415,17 @@ void HeapSimulator::Free(const LogicalBuffer* buffer) {
   const int64 size = size_fn_(*buffer);
   algorithm_->Free(buffer, size);
   no_fragmentation_stats_->Free(buffer, size);
+
+  FillDebugTrace(HeapSimulatorTrace::Event::FREE, buffer, instruction, nullptr);
 }
 
 // ShareBuffer associates buffers with their SharedGroup in shared_buffers_.
 // The 'buffer' must be a non-allocated, non-freed buffer, just like in calls to
 // Alloc.  The 'shared' buffer must be a previously allocated or shared buffer.
 // Both 'buffer' and 'shared' will be associated with the same SharedGroup.
-void HeapSimulator::ShareBuffer(const LogicalBuffer* buffer,
-                                const LogicalBuffer* shared) {
+void HeapSimulator::ShareBuffer(const BufferValue* buffer,
+                                const BufferValue* shared,
+                                const HloInstruction* instruction) {
   CHECK_LE(size_fn_(*buffer), size_fn_(*shared))
       << "ShareBuffer oversized buffer" << *buffer << " shared: " << *shared;
   CHECK(allocated_buffers_.count(buffer) == 0)
@@ -265,11 +435,13 @@ void HeapSimulator::ShareBuffer(const LogicalBuffer* buffer,
   CHECK(freed_buffers_.count(shared) == 0)
       << "ShareBuffer called on freed shared buffer: " << *shared;
 
+  const BufferValue* canonical = nullptr;
   auto shared_it = shared_buffers_.find(shared);
   if (shared_it != shared_buffers_.end()) {
     // The 'shared' buffer already has a group; it might be the canonical, but
     // also might not be.  Just add 'buffer' to the existing group.
     std::shared_ptr<SharedGroup> group = shared_it->second;
+    canonical = group->canonical;
     ++group->refcount;
     shared_buffers_.emplace(buffer, group);
   } else {
@@ -278,11 +450,15 @@ void HeapSimulator::ShareBuffer(const LogicalBuffer* buffer,
     CHECK(allocated_buffers_.count(shared) > 0)
         << "ShareBuffer called on non-allocated shared buffer: " << *shared;
     auto group = std::make_shared<SharedGroup>();
-    group->canonical = shared;
+    canonical = shared;
+    group->canonical = canonical;
     group->refcount = 2;
     shared_buffers_.emplace(buffer, group);
     shared_buffers_.emplace(shared, group);
   }
+
+  FillDebugTrace(HeapSimulatorTrace::Event::SHARE_WITH, buffer, instruction,
+                 canonical);
 }
 
 HeapSimulator::Result HeapSimulator::Finish() {
@@ -293,7 +469,7 @@ HeapSimulator::Result HeapSimulator::Finish() {
   // collecting statistics, e.g. NoFragmentationStatsHeap.
   if (!result.chunk_map.empty()) {
     for (const auto& share_pair : shared_buffers_) {
-      const LogicalBuffer* buffer = share_pair.first;
+      const BufferValue* buffer = share_pair.first;
       std::shared_ptr<SharedGroup> group = share_pair.second;
       if (buffer != group->canonical) {
         // The canonical must already exist in the chunk_map, since we called
@@ -304,23 +480,80 @@ HeapSimulator::Result HeapSimulator::Finish() {
         result.chunk_map.emplace(buffer, chunk);
       }
     }
+    // If we were told to assign specific buffers, make sure we've assigned
+    // exactly that many buffers.
+    if (options_.buffers_to_assign != nullptr) {
+      CHECK_EQ(options_.buffers_to_assign->size(), result.chunk_map.size());
+    }
   }
 
   // Fragmentation is the difference between the actual and ideal sizes.
   const Result no_frag_result = no_fragmentation_stats_->Finish();
   result.fragmentation_size = result.heap_size - no_frag_result.heap_size;
 
+  // Copy the debug trace we collected to the final result.
+  result.debug_trace.Swap(&debug_trace_);
+
   return result;
 }
 
-void NoFragmentationStatsHeap::Alloc(const LogicalBuffer* buffer, int64 size) {
+void HeapSimulator::FillDebugTrace(HeapSimulatorTrace::Event::Kind kind,
+                                   const BufferValue* buffer,
+                                   const HloInstruction* instruction,
+                                   const BufferValue* share_with_canonical) {
+  HeapSimulatorTrace::Event* event = debug_trace_.add_events();
+  event->set_kind(kind);
+  event->set_buffer_id(buffer->id());
+  event->set_computation_name(instruction->parent()->name());
+  event->set_instruction_name(instruction->name());
+  if (kind == HeapSimulatorTrace::Event::SHARE_WITH) {
+    CHECK(share_with_canonical != nullptr);
+    event->set_share_with_canonical_id(share_with_canonical->id());
+  } else {
+    CHECK(share_with_canonical == nullptr);
+  }
+}
+
+void NoFragmentationStatsHeap::Alloc(const BufferValue* buffer, int64 size) {
   current_heap_size_ += size;
   if (current_heap_size_ > max_heap_size_) {
     max_heap_size_ = current_heap_size_;
   }
 }
 
-void NoFragmentationStatsHeap::Free(const LogicalBuffer* buffer, int64 size) {
+void NoFragmentationStatsHeap::Alloc(const BufferValue* buffer, int64 size,
+                                     const HloInstruction* instruction) {
+  // The output buffer of while/call/conditional is always aliased with the
+  // output buffer of the root instruction in the body. Don't double count.
+  if (instruction == nullptr ||
+      (instruction->opcode() != HloOpcode::kWhile &&
+       instruction->opcode() != HloOpcode::kCall &&
+       instruction->opcode() != HloOpcode::kConditional)) {
+    Alloc(buffer, size);
+  }
+}
+
+void NoFragmentationStatsHeap::AccountForSubcomputationMemory(
+    const HloInstruction* instruction,
+    const tensorflow::gtl::FlatMap<const HloComputation*, int64>&
+        memory_by_computation) {
+  // We only count the memory usage of the largest subcomputation, instead of
+  // adding them all, because subcomputations won't execute in parallel.
+  int64 max_subcomputation_bytes = 0;
+  for (const auto* c : instruction->called_computations()) {
+    auto it = memory_by_computation.find(c);
+    if (it != memory_by_computation.end()) {
+      int64 subcomputation_bytes = it->second;
+      if (subcomputation_bytes > max_subcomputation_bytes) {
+        max_subcomputation_bytes = subcomputation_bytes;
+      }
+    }
+  }
+  max_heap_size_ =
+      std::max(max_heap_size_, current_heap_size_ + max_subcomputation_bytes);
+}
+
+void NoFragmentationStatsHeap::Free(const BufferValue* buffer, int64 size) {
   current_heap_size_ -= size;
 }
 
@@ -332,12 +565,12 @@ HeapSimulator::Result NoFragmentationStatsHeap::Finish() {
   return result;
 }
 
-void DecreasingSizeRunsHeap::Alloc(const LogicalBuffer* buffer, int64 size) {
+void DecreasingSizeRunsHeap::Alloc(const BufferValue* buffer, int64 size) {
   SetMode(kAlloc);
   run_.emplace_back(Op{buffer, size});
 }
 
-void DecreasingSizeRunsHeap::Free(const LogicalBuffer* buffer, int64 size) {
+void DecreasingSizeRunsHeap::Free(const BufferValue* buffer, int64 size) {
   CHECK(mode_ != kInit) << "Free called on empty heap: " << *buffer;
   SetMode(kFree);
   run_.emplace_back(Op{buffer, size});
@@ -378,7 +611,7 @@ void DecreasingSizeRunsHeap::CallAndDrainRun() {
   run_.clear();
 }
 
-void LazyBestFitHeap::Alloc(const LogicalBuffer* buffer, int64 size) {
+void LazyBestFitHeap::Alloc(const BufferValue* buffer, int64 size) {
   // Degenerate case: 0-sized buffers are always allocated at offset 0.
   if (size == 0) {
     result_.chunk_map.emplace(buffer, Chunk{0, 0});
@@ -446,7 +679,7 @@ void LazyBestFitHeap::Alloc(const LogicalBuffer* buffer, int64 size) {
   result_.chunk_map.emplace(buffer, Chunk{kLazyAllocOffset, size});
 }
 
-void LazyBestFitHeap::Free(const LogicalBuffer* buffer, int64 size) {
+void LazyBestFitHeap::Free(const BufferValue* buffer, int64 size) {
   auto alloc_it = result_.chunk_map.find(buffer);
   CHECK(alloc_it != result_.chunk_map.end())
       << "Free called on non-allocated buffer: " << *buffer;

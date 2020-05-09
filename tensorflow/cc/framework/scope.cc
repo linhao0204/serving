@@ -16,84 +16,14 @@ limitations under the License.
 #include <algorithm>
 #include <vector>
 
-#include "tensorflow/cc/framework/scope.h"
+#include "tensorflow/cc/framework/scope_internal.h"
 #include "tensorflow/core/common_runtime/shape_refiner.h"
 #include "tensorflow/core/framework/node_def_util.h"
 #include "tensorflow/core/graph/graph_constructor.h"
 #include "tensorflow/core/graph/node_builder.h"
+#include "tensorflow/core/lib/strings/str_util.h"
 
 namespace tensorflow {
-
-class Scope::Impl {
- private:
-  friend class Scope;
-
-  // Tag types to choose the constructor to dispatch.
-  struct Tags {
-    enum class ScopeName;
-    enum class OpName;
-    enum class ControlDeps;
-    enum class Device;
-    enum class SingleUseScope;
-    enum class ExitOnError;
-    enum class KernelLabel;
-    enum class Colocate;
-  };
-
-  // A NameMap is used to keep track of suffixes for names used in a scope. A
-  // name that has not been used so far in a scope will get no suffix. Later
-  // uses of the same name will get suffixes _1, _2, _3, etc. Multiple scopes
-  // can share the same NameMap. For instance, a new scope created using
-  // WithControlDependencies() should would share the same NameMap with the
-  // parent.
-  typedef std::unordered_map<string, int> NameMap;
-
-  Impl(Graph* graph, Status* status, NameMap* name_map, ShapeRefiner* refiner);
-  Impl(const Scope& other, Tags::ScopeName, const string& name,
-       bool copy_names);
-  Impl(const Scope& other, Tags::OpName, const string& name,
-       const string& op_name);
-  Impl(const Scope& other, Tags::ControlDeps,
-       std::vector<Operation> control_deps, bool clear_control_deps);
-  Impl(const Scope& other, Tags::Device, const string& device);
-  Impl(const Scope& other, Tags::SingleUseScope, const string& op_name);
-  Impl(const Scope& other, Tags::ExitOnError);
-  Impl(const Scope& other, Tags::KernelLabel, const string& kernel_label);
-  Impl(const Scope& other, Tags::Colocate, const Operation& colocate_with_op,
-       bool clear_colocations);
-
-  std::unordered_set<string> GetColocationConstraints(
-      const Operation& colocate_with_op) const;
-
-  // Helper functions to get a unique names.
-  string GetUniqueName(const string& prefix, bool check_single_use) const;
-  string GetNameForOp(const string& default_name) const;
-
-  bool single_use_scope() const { return scope_used_ != nullptr; }
-
-  // The graph, status, and name maps are shared by all child scopes
-  // created from a single 'root' scope. A root scope is created by calling the
-  // Scope::NewRootScope function, which creates a new graph, a new status and
-  // the name maps.
-  std::shared_ptr<Graph> graph_ = nullptr;
-  std::shared_ptr<Status> status_ = nullptr;
-  std::shared_ptr<NameMap> name_map_ = nullptr;
-  std::shared_ptr<ShapeRefiner> refiner_ = nullptr;
-
-  // If scope_used_ is not nullptr, op_name_ should be empty and
-  // GetUniqueNameForOp can only be called once on this scope. More calls to
-  // GetUniqueNameForOp will cause an error status to be set on this scope.
-  std::shared_ptr<bool> scope_used_ = nullptr;
-
-  const std::vector<Operation> control_deps_;
-
-  const string name_ = "";
-  const string op_name_ = "";
-  const bool exit_on_error_ = false;
-  const string kernel_label_ = "";
-  const string device_ = "";
-  const std::unordered_set<string> colocation_constraints_;
-};
 
 Scope::Scope(Impl* impl) : impl_(impl) {}
 
@@ -107,20 +37,47 @@ Scope& Scope::operator=(const Scope& other) {
   return *this;
 }
 
+namespace {
+const char kScopeSeparator[] = "/";
+const char kSuffixSeparator[] = "_";
+}  // namespace
+
 Scope::Impl::Impl(Graph* graph, Status* status, NameMap* name_map,
-                  ShapeRefiner* refiner)
+                  ShapeRefiner* refiner, bool disable_shape_inference)
     : graph_(graph),
       status_(status),
       name_map_(name_map),
       refiner_(refiner),
       scope_used_(nullptr),
-      colocation_constraints_() {}
+      colocation_constraints_(),
+      disable_shape_inference_(disable_shape_inference) {}
+
+Scope::Impl::Impl(const std::shared_ptr<Graph>& graph,
+                  const std::shared_ptr<Status>& status,
+                  const std::shared_ptr<NameMap>& name_map,
+                  const std::shared_ptr<ShapeRefiner>& refiner)
+    : graph_(graph),
+      status_(status),
+      name_map_(name_map),
+      refiner_(refiner),
+      scope_used_(nullptr),
+      colocation_constraints_(),
+      disable_shape_inference_(false) {}
 
 Scope Scope::NewRootScope() {
   Graph* graph = new Graph(OpRegistry::Global());
   ShapeRefiner* refiner =
-      new ShapeRefiner(graph->versions().producer(), graph->op_registry());
-  return Scope(new Impl(graph, new Status, new Impl::NameMap, refiner));
+      new ShapeRefiner(graph->versions(), graph->op_registry());
+  return Scope(new Impl(graph, new Status, new Impl::NameMap, refiner,
+                        /* disable_shape_inference */ false));
+}
+
+Scope Scope::DisabledShapeInferenceScope() {
+  Graph* graph = new Graph(OpRegistry::Global());
+  ShapeRefiner* refiner =
+      new ShapeRefiner(graph->versions(), graph->op_registry());
+  return Scope(new Impl(graph, new Status, new Impl::NameMap, refiner,
+                        /* disable_shape_inference */ true));
 }
 
 Scope::Impl::Impl(const Scope& other, Tags::ScopeName, const string& name,
@@ -137,7 +94,8 @@ Scope::Impl::Impl(const Scope& other, Tags::ScopeName, const string& name,
       exit_on_error_(other.impl()->exit_on_error_),
       kernel_label_(other.impl()->kernel_label_),
       device_(other.impl()->device_),
-      colocation_constraints_(other.impl()->colocation_constraints_) {}
+      colocation_constraints_(other.impl()->colocation_constraints_),
+      disable_shape_inference_(other.impl()->disable_shape_inference_) {}
 
 Scope::Impl::Impl(const Scope& other, Tags::OpName, const string& name,
                   const string& op_name)
@@ -152,7 +110,8 @@ Scope::Impl::Impl(const Scope& other, Tags::OpName, const string& name,
       exit_on_error_(other.impl()->exit_on_error_),
       kernel_label_(other.impl()->kernel_label_),
       device_(other.impl()->device_),
-      colocation_constraints_(other.impl()->colocation_constraints_) {}
+      colocation_constraints_(other.impl()->colocation_constraints_),
+      disable_shape_inference_(other.impl()->disable_shape_inference_) {}
 
 Scope::Impl::Impl(const Scope& other, Tags::ControlDeps,
                   std::vector<Operation> control_deps, bool clear_control_deps)
@@ -173,7 +132,8 @@ Scope::Impl::Impl(const Scope& other, Tags::ControlDeps,
       exit_on_error_(other.impl()->exit_on_error_),
       kernel_label_(other.impl()->kernel_label_),
       device_(other.impl()->device_),
-      colocation_constraints_(other.impl()->colocation_constraints_) {}
+      colocation_constraints_(other.impl()->colocation_constraints_),
+      disable_shape_inference_(other.impl()->disable_shape_inference_) {}
 
 Scope::Impl::Impl(const Scope& other, Tags::Device, const string& device)
     : graph_(other.impl()->graph_),
@@ -187,7 +147,8 @@ Scope::Impl::Impl(const Scope& other, Tags::Device, const string& device)
       exit_on_error_(other.impl()->exit_on_error_),
       kernel_label_(other.impl()->kernel_label_),
       device_(device),
-      colocation_constraints_(other.impl()->colocation_constraints_) {}
+      colocation_constraints_(other.impl()->colocation_constraints_),
+      disable_shape_inference_(other.impl()->disable_shape_inference_) {}
 
 Scope::Impl::Impl(const Scope& other, Tags::SingleUseScope,
                   const string& op_name)
@@ -202,7 +163,8 @@ Scope::Impl::Impl(const Scope& other, Tags::SingleUseScope,
       exit_on_error_(other.impl()->exit_on_error_),
       kernel_label_(other.impl()->kernel_label_),
       device_(other.impl()->device_),
-      colocation_constraints_(other.impl()->colocation_constraints_) {}
+      colocation_constraints_(other.impl()->colocation_constraints_),
+      disable_shape_inference_(other.impl()->disable_shape_inference_) {}
 
 Scope::Impl::Impl(const Scope& other, Tags::ExitOnError)
     : graph_(other.impl()->graph_),
@@ -216,7 +178,8 @@ Scope::Impl::Impl(const Scope& other, Tags::ExitOnError)
       exit_on_error_(true),
       kernel_label_(other.impl()->kernel_label_),
       device_(other.impl()->device_),
-      colocation_constraints_(other.impl()->colocation_constraints_) {}
+      colocation_constraints_(other.impl()->colocation_constraints_),
+      disable_shape_inference_(other.impl()->disable_shape_inference_) {}
 
 Scope::Impl::Impl(const Scope& other, Tags::KernelLabel,
                   const string& kernel_label)
@@ -231,7 +194,8 @@ Scope::Impl::Impl(const Scope& other, Tags::KernelLabel,
       exit_on_error_(other.impl()->exit_on_error_),
       kernel_label_(kernel_label),
       device_(other.impl()->device_),
-      colocation_constraints_(other.impl()->colocation_constraints_) {}
+      colocation_constraints_(other.impl()->colocation_constraints_),
+      disable_shape_inference_(other.impl()->disable_shape_inference_) {}
 
 Scope::Impl::Impl(const Scope& other, Tags::Colocate,
                   const Operation& colocate_with_op, bool clear_colocations)
@@ -249,18 +213,19 @@ Scope::Impl::Impl(const Scope& other, Tags::Colocate,
       colocation_constraints_(
           clear_colocations
               ? std::unordered_set<string>()
-              : other.impl()->GetColocationConstraints(colocate_with_op)) {}
+              : other.impl()->GetColocationConstraints(colocate_with_op)),
+      disable_shape_inference_(other.impl()->disable_shape_inference_) {}
 
 std::unordered_set<string> Scope::Impl::GetColocationConstraints(
     const Operation& colocate_with_op) const {
   std::unordered_set<string> current_constraints(colocation_constraints_);
-  const NodeDef& node_def = colocate_with_op.node()->def();
+  const AttrSlice attrs = colocate_with_op.node()->attrs();
   std::vector<string> node_constraints;
-  if (GetNodeAttr(node_def, kColocationAttrName, &node_constraints).ok()) {
+  if (GetNodeAttr(attrs, kColocationAttrName, &node_constraints).ok()) {
     for (const string& entry : node_constraints) {
       StringPiece s(entry);
-      if (s.Consume(kColocationGroupPrefix)) {
-        current_constraints.insert(s.ToString());
+      if (str_util::ConsumePrefix(&s, kColocationGroupPrefix)) {
+        current_constraints.emplace(s);
       }
     }
   } else {
@@ -277,7 +242,7 @@ std::shared_ptr<Graph> Scope::graph_as_shared_ptr() const {
   return impl()->graph_;
 }
 
-Status Scope::status() const { return *impl()->status_; };
+Status Scope::status() const { return *impl()->status_; }
 
 const std::vector<Operation>& Scope::control_deps() const {
   return impl()->control_deps_;
@@ -348,19 +313,23 @@ string Scope::Impl::GetUniqueName(const string& prefix,
     return prefix;
   }
   auto entry = name_map_->find(prefix);
-  string unique_name = prefix;
   if (entry == name_map_->end()) {
     name_map_->insert({prefix, 0});
-  } else {
-    unique_name = strings::StrCat(unique_name, "_", ++entry->second);
+    return prefix;
   }
+  string unique_name;
+  do {
+    unique_name = strings::StrCat(prefix, kSuffixSeparator, ++entry->second);
+  } while (name_map_->find(unique_name) != name_map_->end());
+  name_map_->insert({unique_name, 0});
   return unique_name;
 }
 
 string Scope::Impl::GetNameForOp(const string& default_name) const {
   const string unique_name =
       GetUniqueName(default_name, true /* check_single_use */);
-  const string sep = name_.empty() || unique_name.empty() ? "" : "/";
+  const string sep =
+      name_.empty() || unique_name.empty() ? "" : kScopeSeparator;
   return strings::StrCat(name_, sep, unique_name);
 }
 
@@ -385,7 +354,8 @@ Scope Scope::NewSubScope(const string& child_scope_name) const {
   }
   const string unique_name =
       impl()->GetUniqueName(child_scope_name, false /* check_single_use */);
-  const string sep = impl()->name_.empty() || unique_name.empty() ? "" : "/";
+  const string sep =
+      impl()->name_.empty() || unique_name.empty() ? "" : kScopeSeparator;
   return Scope(new Impl(*this, Impl::Tags::ScopeName(),
                         strings::StrCat(impl()->name_, sep, unique_name),
                         false /* copy_names */));
@@ -452,7 +422,7 @@ CompositeOpScopes Scope::GetCompositeOpScopes(
   if (!impl()->single_use_scope()) {
     Scope child = NewSubScope(impl()->op_name_.empty() ? composite_op_name
                                                        : impl()->op_name_);
-    const string child_op_sep = impl()->name_.empty() ? "" : "_";
+    const string child_op_sep = impl()->name_.empty() ? "" : kSuffixSeparator;
     const string child_name =
         strings::StrCat(impl()->name_, child_op_sep, child.impl()->name_);
     return {child,
@@ -462,6 +432,39 @@ CompositeOpScopes Scope::GetCompositeOpScopes(
                            true /* copy_names */)),
             *this};
   }
+}
+
+Status Scope::DoShapeInference(Node* node) const {
+  if (impl_->disable_shape_inference_) return Status::OK();
+  return impl_->refiner_->AddNode(node);
+}
+
+class InternalScope {
+ public:
+  // NewScope doesn't take ownership of the inputs.
+  static Scope NewScope(Graph* graph, Status* status, ShapeRefiner* refiner) {
+    Scope::Impl::NameMap* name_map = new Scope::Impl::NameMap;
+    for (const Node* node : graph->nodes()) {
+      const string& name = node->name();
+      (*name_map)[name] = 0;
+      // Add all name prefixes ('/' separated).
+      size_t idx = -1;
+      while ((idx = name.find(kScopeSeparator, idx + 1)) != string::npos) {
+        (*name_map)[name.substr(0, idx)] = 0;
+      }
+    }
+    // We provide null destructors for these shared ptrs (except for name_map)
+    // since the caller owns them and doesn't want the scope to destroy them.
+    return Scope(new Scope::Impl(
+        std::shared_ptr<Graph>(graph, [](Graph*) {}),
+        std::shared_ptr<Status>(status, [](Status*) {}),
+        std::shared_ptr<Scope::Impl::NameMap>(name_map),
+        std::shared_ptr<ShapeRefiner>(refiner, [](ShapeRefiner*) {})));
+  }
+};
+
+Scope NewInternalScope(Graph* graph, Status* status, ShapeRefiner* refiner) {
+  return InternalScope::NewScope(graph, status, refiner);
 }
 
 }  // namespace tensorflow

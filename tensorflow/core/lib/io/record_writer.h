@@ -13,8 +13,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#ifndef TENSORFLOW_LIB_IO_RECORD_WRITER_H_
-#define TENSORFLOW_LIB_IO_RECORD_WRITER_H_
+#ifndef TENSORFLOW_CORE_LIB_IO_RECORD_WRITER_H_
+#define TENSORFLOW_CORE_LIB_IO_RECORD_WRITER_H_
 
 #include "tensorflow/core/lib/core/status.h"
 #include "tensorflow/core/lib/core/stringpiece.h"
@@ -53,6 +53,10 @@ class RecordWriter {
   RecordWriter(WritableFile* dest,
                const RecordWriterOptions& options = RecordWriterOptions());
 
+  // Calls Close() and logs if an error occurs.
+  //
+  // TODO(jhseu): Require that callers explicitly call Close() and remove the
+  // implicit Close() call in the destructor.
   ~RecordWriter();
 
   Status WriteRecord(StringPiece slice);
@@ -61,6 +65,12 @@ class RecordWriter {
   // RecordWriter to the WritableFile. Does *not* flush the
   // WritableFile.
   Status Flush();
+
+  // Writes all output to the file. Does *not* close the WritableFile.
+  //
+  // After calling Close(), any further calls to `WriteRecord()` or `Flush()`
+  // are invalid.
+  Status Close();
 
  private:
   WritableFile* dest_;
@@ -72,4 +82,4 @@ class RecordWriter {
 }  // namespace io
 }  // namespace tensorflow
 
-#endif  // TENSORFLOW_LIB_IO_RECORD_WRITER_H_
+#endif  // TENSORFLOW_CORE_LIB_IO_RECORD_WRITER_H_

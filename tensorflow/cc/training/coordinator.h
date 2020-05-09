@@ -13,8 +13,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#ifndef THIRD_PARTY_TENSORFLOW_CC_TRAINING_COORDINATOR_H_
-#define THIRD_PARTY_TENSORFLOW_CC_TRAINING_COORDINATOR_H_
+#ifndef TENSORFLOW_CC_TRAINING_COORDINATOR_H_
+#define TENSORFLOW_CC_TRAINING_COORDINATOR_H_
 
 #include <atomic>
 #include <memory>
@@ -36,8 +36,8 @@ class RunnerInterface {
  public:
   virtual ~RunnerInterface() {}
   virtual Status Join() = 0;
-  virtual Status ExportRunMetadata(RunMetadata* metadata) const {
-    return Status(error::INVALID_ARGUMENT, "No RunMetadata to export.");
+  virtual Status ExportCostGraph(CostGraphDef* cost_graph) const {
+    return Status(error::INVALID_ARGUMENT, "No cost model to export.");
   }
   /// Returns true iff the runner is running, i.e. if it is trying to populate
   /// its queue.
@@ -128,4 +128,4 @@ class Coordinator {
 
 }  // namespace tensorflow
 
-#endif  // THIRD_PARTY_TENSORFLOW_CC_TRAINING_COORDINATOR_H_
+#endif  // TENSORFLOW_CC_TRAINING_COORDINATOR_H_

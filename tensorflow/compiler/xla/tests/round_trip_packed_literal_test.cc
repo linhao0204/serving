@@ -15,11 +15,11 @@ limitations under the License.
 
 #include <memory>
 
+#include "absl/types/span.h"
 #include "tensorflow/compiler/xla/client/global_data.h"
 #include "tensorflow/compiler/xla/client/local_client.h"
 #include "tensorflow/compiler/xla/layout_util.h"
-#include "tensorflow/compiler/xla/legacy_flags/cpu_compiler_flags.h"
-#include "tensorflow/compiler/xla/literal_util.h"
+#include "tensorflow/compiler/xla/literal.h"
 #include "tensorflow/compiler/xla/packed_literal_reader.h"
 #include "tensorflow/compiler/xla/shape_util.h"
 #include "tensorflow/compiler/xla/statusor.h"
@@ -28,7 +28,6 @@ limitations under the License.
 #include "tensorflow/compiler/xla/tests/test_macros.h"
 #include "tensorflow/compiler/xla/xla_data.pb.h"
 #include "tensorflow/core/lib/core/casts.h"
-#include "tensorflow/core/lib/gtl/array_slice.h"
 #include "tensorflow/core/platform/env.h"
 #include "tensorflow/core/platform/test.h"
 #include "tensorflow/core/platform/types.h"
@@ -48,8 +47,7 @@ class RoundTripPackedLiteralTest : public ClientLibraryTestBase {
 
 TEST_F(RoundTripPackedLiteralTest, RoundTripsR1F32Length2) {
   string data(sizeof(float) * 2, 0);
-  tensorflow::gtl::MutableArraySlice<float> floats(
-      tensorflow::bit_cast<float*>(data.data()), 2);
+  absl::Span<float> floats(tensorflow::bit_cast<float*>(data.data()), 2);
   floats[0] = 42.0;
   floats[1] = 24.0;
 
@@ -65,14 +63,13 @@ TEST_F(RoundTripPackedLiteralTest, RoundTripsR1F32Length2) {
       reader.Read(ShapeUtil::MakeShape(F32, {2})).ConsumeValueOrDie();
   EXPECT_TRUE(reader.IsExhausted());
 
-  EXPECT_EQ(42.0, LiteralUtil::Get<float>(*actual, {0}));
-  EXPECT_EQ(24.0, LiteralUtil::Get<float>(*actual, {1}));
+  EXPECT_EQ(42.0, actual->Get<float>({0}));
+  EXPECT_EQ(24.0, actual->Get<float>({1}));
 }
 
 TEST_F(RoundTripPackedLiteralTest, RoundTripsR2F32Size2x2Dim0Minor) {
   string data(sizeof(float) * 4, 0);
-  tensorflow::gtl::MutableArraySlice<float> floats(
-      tensorflow::bit_cast<float*>(data.data()), 4);
+  absl::Span<float> floats(tensorflow::bit_cast<float*>(data.data()), 4);
   // With x as the minor dimension, these will become:
   floats[0] = 42.0;  // y=0,x=0
   floats[1] = 24.0;  // y=0,x=1
@@ -95,19 +92,18 @@ TEST_F(RoundTripPackedLiteralTest, RoundTripsR2F32Size2x2Dim0Minor) {
           .ConsumeValueOrDie();
   EXPECT_TRUE(reader.IsExhausted());
 
-  EXPECT_EQ(42.0f, LiteralUtil::Get<float>(*actual, {0, 0}));
-  EXPECT_EQ(24.0f, LiteralUtil::Get<float>(*actual, {0, 1}));
-  EXPECT_EQ(64.0f, LiteralUtil::Get<float>(*actual, {1, 0}));
-  EXPECT_EQ(46.0f, LiteralUtil::Get<float>(*actual, {1, 1}));
+  EXPECT_EQ(42.0f, actual->Get<float>({0, 0}));
+  EXPECT_EQ(24.0f, actual->Get<float>({0, 1}));
+  EXPECT_EQ(64.0f, actual->Get<float>({1, 0}));
+  EXPECT_EQ(46.0f, actual->Get<float>({1, 1}));
 
   std::unique_ptr<Literal> round_tripped = RoundTripToServer(*actual);
-  LiteralTestUtil::ExpectEqual(*round_tripped, *actual);
+  EXPECT_TRUE(LiteralTestUtil::Equal(*round_tripped, *actual));
 }
 
 TEST_F(RoundTripPackedLiteralTest, RoundTripsR2F32Size2x2Dim1Minor) {
   string data(sizeof(float) * 4, 0);
-  tensorflow::gtl::MutableArraySlice<float> floats(
-      tensorflow::bit_cast<float*>(data.data()), 4);
+  absl::Span<float> floats(tensorflow::bit_cast<float*>(data.data()), 4);
   // With y as the minor dimension, these will become:
   floats[0] = 42.0;  // y=0,x=0
   floats[1] = 24.0;  // y=1,x=0
@@ -130,31 +126,14 @@ TEST_F(RoundTripPackedLiteralTest, RoundTripsR2F32Size2x2Dim1Minor) {
           .ConsumeValueOrDie();
   EXPECT_TRUE(reader.IsExhausted());
 
-  EXPECT_EQ(42.0f, LiteralUtil::Get<float>(*actual, {0, 0}));
-  EXPECT_EQ(24.0f, LiteralUtil::Get<float>(*actual, {1, 0}));
-  EXPECT_EQ(64.0f, LiteralUtil::Get<float>(*actual, {0, 1}));
-  EXPECT_EQ(46.0f, LiteralUtil::Get<float>(*actual, {1, 1}));
+  EXPECT_EQ(42.0f, actual->Get<float>({0, 0}));
+  EXPECT_EQ(24.0f, actual->Get<float>({1, 0}));
+  EXPECT_EQ(64.0f, actual->Get<float>({0, 1}));
+  EXPECT_EQ(46.0f, actual->Get<float>({1, 1}));
 
   std::unique_ptr<Literal> round_tripped = RoundTripToServer(*actual);
-  LiteralTestUtil::ExpectEqual(*round_tripped, *actual);
+  EXPECT_TRUE(LiteralTestUtil::Equal(*round_tripped, *actual));
 }
 
 }  // namespace
 }  // namespace xla
-
-int main(int argc, char** argv) {
-  std::vector<tensorflow::Flag> flag_list;
-  xla::legacy_flags::AppendCpuCompilerFlags(&flag_list);
-  xla::string usage = tensorflow::Flags::Usage(argv[0], flag_list);
-  const bool parse_result = tensorflow::Flags::Parse(&argc, argv, flag_list);
-  if (!parse_result) {
-    LOG(ERROR) << "\n" << usage;
-    return 2;
-  }
-  testing::InitGoogleTest(&argc, argv);
-  if (argc > 1) {
-    LOG(ERROR) << "Unknown argument " << argv[1] << "\n" << usage;
-    return 2;
-  }
-  return RUN_ALL_TESTS();
-}

@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 // =============================================================================
-#ifndef THIRD_PARTY_TENSORFLOW_CONTRIB_BOOSTED_TREES_LIB_QUANTILES_WEIGHTED_QUANTILES_STREAM_H_
-#define THIRD_PARTY_TENSORFLOW_CONTRIB_BOOSTED_TREES_LIB_QUANTILES_WEIGHTED_QUANTILES_STREAM_H_
+#ifndef TENSORFLOW_CONTRIB_BOOSTED_TREES_LIB_QUANTILES_WEIGHTED_QUANTILES_STREAM_H_
+#define TENSORFLOW_CONTRIB_BOOSTED_TREES_LIB_QUANTILES_WEIGHTED_QUANTILES_STREAM_H_
 
+#include <cmath>
 #include <memory>
 #include <vector>
 
@@ -57,6 +58,8 @@ namespace quantiles {
 // Compute: O(n * log(1/eps * log(eps * n))).
 // Memory: O(1/eps * log^2(eps * n)) <- for one worker streaming through the
 //                                      entire dataset.
+// An epsilon value of zero would make the algorithm extremely inefficent and
+// therefore, is disallowed.
 template <typename ValueType, typename WeightType,
           typename CompareFn = std::less<ValueType>>
 class WeightedQuantilesStream {
@@ -68,6 +71,9 @@ class WeightedQuantilesStream {
 
   explicit WeightedQuantilesStream(double eps, int64 max_elements)
       : eps_(eps), buffer_(1LL, 2LL), finalized_(false) {
+    // See the class documentation. An epsilon value of zero could cause
+    // perfoamance issues.
+    QCHECK(eps > 0) << "An epsilon value of zero is not allowed.";
     std::tie(max_levels_, block_size_) = GetQuantileSpecs(eps, max_elements);
     buffer_ = Buffer(block_size_, max_elements);
     summary_levels_.reserve(max_levels_);
@@ -91,12 +97,11 @@ class WeightedQuantilesStream {
     // and push weighted quantile summary up the level chain.
     if (buffer_.IsFull()) {
       PushBuffer(buffer_);
-      buffer_.Clear();
     }
   }
 
   // Pushes full buffer while maintaining approximation error invariants.
-  void PushBuffer(const Buffer& buffer) {
+  void PushBuffer(Buffer& buffer) {
     // Validate state.
     QCHECK(!finalized_) << "Finalize() already called.";
 
@@ -124,7 +129,6 @@ class WeightedQuantilesStream {
 
     // Flush any remaining buffer elements.
     PushBuffer(buffer_);
-    buffer_.Clear();
 
     // Create final merged summary.
     local_summary_.Clear();
@@ -296,7 +300,7 @@ WeightedQuantilesStream<ValueType, WeightType, CompareFn>::GetQuantileSpecs(
   if (eps <= std::numeric_limits<double>::epsilon()) {
     // Exact quantile computation at the expense of RAM.
     max_level = 1;
-    block_size = std::max(max_elements, 2LL);
+    block_size = std::max(max_elements, int64{2});
   } else {
     // The bottom-most level will become full at most
     // (max_elements / block_size) times, the level above will become full
@@ -316,11 +320,11 @@ WeightedQuantilesStream<ValueType, WeightType, CompareFn>::GetQuantileSpecs(
       block_size = static_cast<size_t>(ceil(max_level / eps)) + 1;
     }
   }
-  return std::make_tuple(max_level, std::max(block_size, 2LL));
+  return std::make_tuple(max_level, std::max(block_size, int64{2}));
 }
 
 }  // namespace quantiles
 }  // namespace boosted_trees
 }  // namespace tensorflow
 
-#endif  // THIRD_PARTY_TENSORFLOW_CONTRIB_BOOSTED_TREES_LIB_QUANTILES_WEIGHTED_QUANTILES_STREAM_H_
+#endif  // TENSORFLOW_CONTRIB_BOOSTED_TREES_LIB_QUANTILES_WEIGHTED_QUANTILES_STREAM_H_

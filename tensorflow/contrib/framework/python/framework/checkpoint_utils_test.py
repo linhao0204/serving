@@ -117,7 +117,7 @@ class CheckpointsTest(test.TestCase):
 
     # New graph and session.
     with ops.Graph().as_default() as g:
-      with self.test_session(graph=g) as session:
+      with self.session(graph=g) as session:
         with variable_scope.variable_scope("some_scope"):
           my1 = variable_scope.get_variable("my1", [1, 10])
           with variable_scope.variable_scope("some_other_scope"):
@@ -144,6 +144,25 @@ class CheckpointsTest(test.TestCase):
         # Check that tensors are not explicitly in the graph.
         self.assertLess(len(str(session.graph.as_graph_def())), 27000)
 
+  def testInitWithScopeDoesNotCaptureSuffixes(self):
+    checkpoint_dir = self.get_temp_dir()
+    with self.test_session() as session:
+      _, _, _, v4 = _create_checkpoints(session, checkpoint_dir)
+
+    with ops.Graph().as_default() as g:
+      with variable_scope.variable_scope("useful_scope"):
+        my4 = variable_scope.get_variable("var4", [9, 9])
+      with variable_scope.variable_scope("useful_scope_1"):
+        my5_init = [[1.0, 2.0], [3.0, 4.0]]
+        my5 = variable_scope.get_variable("var5", initializer=my5_init)
+
+      checkpoint_utils.init_from_checkpoint(checkpoint_dir,
+                                            {"useful_scope/": "useful_scope/"})
+      with self.session(graph=g) as session:
+        session.run(variables.global_variables_initializer())
+        self.assertAllEqual(my4.eval(session), v4)
+        self.assertAllEqual(my5.eval(session), my5_init)
+
   def testInitFromRootCheckpoint(self):
     checkpoint_dir = self.get_temp_dir()
     with self.test_session() as session:
@@ -151,7 +170,7 @@ class CheckpointsTest(test.TestCase):
 
     # New graph and session.
     with ops.Graph().as_default() as g:
-      with self.test_session(graph=g) as session:
+      with self.session(graph=g) as session:
         with variable_scope.variable_scope("some_scope"):
           my1 = variable_scope.get_variable("var1", [1, 10])
           my2 = variable_scope.get_variable("var2", [10, 10])
@@ -175,7 +194,7 @@ class CheckpointsTest(test.TestCase):
 
     # New graph and session.
     with ops.Graph().as_default() as g:
-      with self.test_session(graph=g) as session:
+      with self.session(graph=g) as session:
         my1 = variable_scope.get_variable("var1", [1, 10])
         my2 = variable_scope.get_variable("var2", [10, 10])
         my3 = variable_scope.get_variable("var3", [100, 100])
@@ -198,7 +217,7 @@ class CheckpointsTest(test.TestCase):
 
     # New graph and session.
     with ops.Graph().as_default() as g:
-      with self.test_session(graph=g) as session:
+      with self.session(graph=g) as session:
         with variable_scope.variable_scope("some_scope"):
           my1 = variable_scope.get_variable(
               name="my1",
@@ -228,7 +247,7 @@ class CheckpointsTest(test.TestCase):
 
     # New graph and session.
     with ops.Graph().as_default() as g:
-      with self.test_session(graph=g) as session:
+      with self.session(graph=g) as session:
         with variable_scope.variable_scope("some_scope"):
           my1 = variable_scope.get_variable(
               name="my1",
@@ -252,7 +271,7 @@ class CheckpointsTest(test.TestCase):
 
     # New graph and session.
     with ops.Graph().as_default() as g:
-      with self.test_session(graph=g) as session:
+      with self.session(graph=g) as session:
         with variable_scope.variable_scope("some_scope"):
           _ = variable_scope.get_variable("my1", [10, 10])
           _ = variable_scope.get_variable(

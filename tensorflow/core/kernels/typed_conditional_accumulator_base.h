@@ -13,8 +13,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#ifndef TENSORFLOW_KERNELS_TYPED_CONDITIONAL_ACCUMULATOR_BASE_H_
-#define TENSORFLOW_KERNELS_TYPED_CONDITIONAL_ACCUMULATOR_BASE_H_
+#ifndef TENSORFLOW_CORE_KERNELS_TYPED_CONDITIONAL_ACCUMULATOR_BASE_H_
+#define TENSORFLOW_CORE_KERNELS_TYPED_CONDITIONAL_ACCUMULATOR_BASE_H_
 
 #include "tensorflow/core/kernels/conditional_accumulator_base.h"
 
@@ -22,7 +22,7 @@ namespace tensorflow {
 
 /*
  * TypedConditionalAccumulatorBase is a templated companion of
- * ConditionalAccumulatorBase which allows for subclassses to use different
+ * ConditionalAccumulatorBase which allows for subclasses to use different
  * types for the input gradients. (See ConditionalAccumulator and
  * SparseConditionalAccumulator.)
  *
@@ -91,4 +91,4 @@ class TypedConditionalAccumulatorBase : public ConditionalAccumulatorBase {
 
 }  // namespace tensorflow
 
-#endif  // TENSORFLOW_KERNELS_TYPED_CONDITIONAL_ACCUMULATOR_BASE_H_
+#endif  // TENSORFLOW_CORE_KERNELS_TYPED_CONDITIONAL_ACCUMULATOR_BASE_H_

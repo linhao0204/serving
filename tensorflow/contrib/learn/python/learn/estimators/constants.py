@@ -13,9 +13,11 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Constants regarding Estimators.
+"""Constants regarding Estimators (deprecated).
 
-This file is obsoleted in the move of Estimator to core.
+This module and all its submodules are deprecated. See
+[contrib/learn/README.md](https://www.tensorflow.org/code/tensorflow/contrib/learn/README.md)
+for migration instructions.
 """
 from __future__ import absolute_import
 from __future__ import division
@@ -24,6 +26,8 @@ from __future__ import print_function
 
 class ProblemType(object):
   """Enum-like values for the type of problem that the model solves.
+
+  THIS CLASS IS DEPRECATED.
 
   These values are used when exporting the model to produce the appropriate
   signature function for serving.
@@ -38,3 +42,8 @@ class ProblemType(object):
   CLASSIFICATION = 1
   LINEAR_REGRESSION = 2
   LOGISTIC_REGRESSION = 3
+
+
+# CollectionDef key for the input feature keys.
+# TODO(b/34388557): This is a stopgap; please follow the bug to learn of changes
+COLLECTION_DEF_KEY_FOR_INPUT_FEATURE_KEYS = "input_feature_keys"

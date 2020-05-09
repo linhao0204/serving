@@ -11,13 +11,15 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
-#ifndef _TENSORFLOW_CORE_KERNELS_ADJUST_HUE_OP_H
-#define _TENSORFLOW_CORE_KERNELS_ADJUST_HUE_OP_H
+#ifndef TENSORFLOW_CORE_KERNELS_ADJUST_HUE_OP_H_
+#define TENSORFLOW_CORE_KERNELS_ADJUST_HUE_OP_H_
 
 #if GOOGLE_CUDA
 #define EIGEN_USE_GPU
 
 #include "third_party/eigen3/unsupported/Eigen/CXX11/Tensor"
+
+#include "tensorflow/core/framework/types.h"
 
 namespace tensorflow {
 
@@ -26,17 +28,13 @@ typedef Eigen::GpuDevice GPUDevice;
 namespace functor {
 
 struct AdjustHueGPU {
-  void operator()(
-      GPUDevice* device,
-      const int64 number_of_elements,
-      const float* const input,
-      const float* const delta,
-      float* const output
-  );
+  void operator()(GPUDevice* device, const int64 number_of_elements,
+                  const float* const input, const float* const delta,
+                  float* const output);
 };
 
-} // namespace functor
-} // namespace tensorflow
+}  // namespace functor
+}  // namespace tensorflow
 
-#endif // GOOGLE_CUDA
-#endif // _TENSORFLOW_CORE_KERNELS_ADJUST_HUE_OP_H
+#endif  // GOOGLE_CUDA
+#endif  // TENSORFLOW_CORE_KERNELS_ADJUST_HUE_OP_H_

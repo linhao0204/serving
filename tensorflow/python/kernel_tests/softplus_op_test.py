@@ -21,7 +21,9 @@ from __future__ import print_function
 import numpy as np
 
 from tensorflow.python.framework import constant_op
+from tensorflow.python.framework import errors
 from tensorflow.python.ops import gradient_checker
+from tensorflow.python.ops import gradients_impl
 from tensorflow.python.ops import nn_ops
 import tensorflow.python.ops.nn_grad  # pylint: disable=unused-import
 from tensorflow.python.platform import test
@@ -84,6 +86,48 @@ class SoftplusTest(test.TestCase):
           x, [2, 5], y, [2, 5], x_init_value=x_init)
     print("softplus (float) gradient err = ", err)
     self.assertLess(err, 1e-4)
+
+  def testGradGrad(self):
+    with self.test_session():
+      x = constant_op.constant(
+          [-0.9, -0.7, -0.5, -0.3, -0.1, 0.1, 0.3, 0.5, 0.7, 0.9],
+          shape=[2, 5],
+          name="x")
+      y = nn_ops.softplus(x, name="softplus")
+      (grad,) = gradients_impl.gradients(y, x)
+      x_init = np.asarray(
+          [[-0.9, -0.7, -0.5, -0.3, -0.1], [0.1, 0.3, 0.5, 0.7, 0.9]],
+          dtype=np.float32,
+          order="F")
+      err = gradient_checker.compute_gradient_error(
+          x, [2, 5], grad, [2, 5], x_init_value=x_init)
+    print("softplus (float) gradient of gradient err = ", err)
+    self.assertLess(err, 5e-5)
+
+  def testGradGradGrad(self):
+    with self.test_session():
+      x = constant_op.constant(
+          [-0.9, -0.7, -0.5, -0.3, -0.1, 0.1, 0.3, 0.5, 0.7, 0.9],
+          shape=[2, 5],
+          name="x")
+      y = nn_ops.softplus(x, name="softplus")
+      (grad,) = gradients_impl.gradients(y, x)
+      (grad_grad,) = gradients_impl.gradients(grad, x)
+      x_init = np.asarray(
+          [[-0.9, -0.7, -0.5, -0.3, -0.1], [0.1, 0.3, 0.5, 0.7, 0.9]],
+          dtype=np.float32,
+          order="F")
+      err = gradient_checker.compute_gradient_error(
+          x, [2, 5], grad_grad, [2, 5], x_init_value=x_init)
+    print("softplus (float) third-order gradient err = ", err)
+    self.assertLess(err, 5e-5)
+
+  def testNoInts(self):
+    with self.test_session():
+      with self.assertRaisesRegexp(
+          errors.InvalidArgumentError,
+          "No OpKernel was registered to support Op 'Softplus'"):
+        nn_ops.softplus(constant_op.constant(7)).eval()
 
 
 if __name__ == "__main__":

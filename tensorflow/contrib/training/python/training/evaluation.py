@@ -36,9 +36,8 @@ out the metrics values to stdout:
 
   # Choose the metrics to compute:
   names_to_values, names_to_updates = tf.contrib.metrics.aggregate_metric_map({
-      "accuracy": tf.contrib.metrics.streaming_accuracy(predictions, labels),
-      "mse": tf.contrib.metrics.streaming_mean_squared_error(
-        predictions, labels),
+      "accuracy": tf.metrics.accuracy(labels, predictions),
+      "mse": tf.metrics.mean_squared_error(labels, predictions),
   })
 
   # Define the summaries to write:
@@ -81,9 +80,8 @@ more summaries and call the evaluate_repeatedly method:
 
   # Choose the metrics to compute:
   names_to_values, names_to_updates = tf.contrib.metrics.aggregate_metric_map({
-      "accuracy": tf.contrib.metrics.streaming_accuracy(predictions, labels),
-      "mse": tf.contrib.metrics.streaming_mean_squared_error(
-          predictions, labels),
+      "accuracy": tf.metrics.accuracy(labels, predictions),
+      "mse": tf.metrics.mean_squared_error(labels, predictions),
   })
 
   # Define the summaries to write:
@@ -140,14 +138,13 @@ from __future__ import print_function
 
 import time
 
-from tensorflow.contrib.framework.python.ops import variables
 from tensorflow.python.ops import state_ops
 from tensorflow.python.platform import tf_logging as logging
 from tensorflow.python.summary import summary
 from tensorflow.python.training import basic_session_run_hooks
+from tensorflow.python.training import checkpoint_management
 from tensorflow.python.training import evaluation
 from tensorflow.python.training import monitored_session
-from tensorflow.python.training import saver as tf_saver
 from tensorflow.python.training import session_run_hook
 from tensorflow.python.training import training_util
 
@@ -192,7 +189,7 @@ def wait_for_new_checkpoint(checkpoint_dir,
   logging.info('Waiting for new checkpoint at %s', checkpoint_dir)
   stop_time = time.time() + timeout if timeout is not None else None
   while True:
-    checkpoint_path = tf_saver.latest_checkpoint(checkpoint_dir)
+    checkpoint_path = checkpoint_management.latest_checkpoint(checkpoint_dir)
     if checkpoint_path is None or checkpoint_path == last_checkpoint:
       if stop_time is not None and time.time() + seconds_to_sleep > stop_time:
         return None
@@ -226,7 +223,7 @@ def checkpoints_iterator(checkpoint_dir,
 
   This behavior gives control to callers on what to do if checkpoints do not
   come fast enough or stop being generated.  For example, if callers have a way
-  to detect that the training has stopped and know that no new new checkpoints
+  to detect that the training has stopped and know that no new checkpoints
   will be generated, they can provide a `timeout_fn` that returns `True` when
   the training has stopped.  If they know that the training is still going on
   they return `False` instead.
@@ -254,7 +251,7 @@ def checkpoints_iterator(checkpoint_dir,
         logging.info('Timed-out waiting for a checkpoint.')
         return
       if timeout_fn():
-        # The timeout_fn indicated that we are truely done.
+        # The timeout_fn indicated that we are truly done.
         return
       else:
         # The timeout_fn indicated that more checkpoints may come.
@@ -290,25 +287,30 @@ class SummaryAtEndHook(session_run_hook.SessionRunHook):
       ValueError: If both `log_dir` and `summary_writer` are `None`.
     """
     self._summary_op = summary_op
+    self._replace_summary_op = summary_op is None
     self._feed_dict = feed_dict
     self._summary_writer = summary_writer
     self._log_dir = log_dir
-    self._summary_writer = summary_writer
     if self._log_dir is None and self._summary_writer is None:
       raise ValueError('One of log_dir or summary_writer should be used.')
-    self._global_step = variables.get_or_create_global_step()
 
   def begin(self):
+    if self._replace_summary_op:
+      # This can still remain None if there are no summaries.
+      self._summary_op = summary.merge_all()
+    self._global_step = training_util.get_or_create_global_step()
+
+  def after_create_session(self, session, coord):
     if self._summary_writer is None and self._log_dir:
       self._summary_writer = summary.FileWriterCache.get(self._log_dir)
-    if self._summary_op is None:
-      self._summary_op = summary.merge_all()
 
   def end(self, session):
-    global_step = training_util.global_step(session, self._global_step)
-    summary_str = session.run(self._summary_op, self._feed_dict)
+    if self._summary_op is not None:
+      global_step = training_util.global_step(session, self._global_step)
+      summary_str = session.run(self._summary_op, self._feed_dict)
+      if self._summary_writer:
+        self._summary_writer.add_summary(summary_str, global_step)
     if self._summary_writer:
-      self._summary_writer.add_summary(summary_str, global_step)
       self._summary_writer.flush()
 
 
@@ -368,7 +370,7 @@ def evaluate_repeatedly(checkpoint_dir,
 
   One may also consider using a `tf.contrib.training.SummaryAtEndHook` to record
   summaries after the `eval_ops` have run. If `eval_ops` is `None`, the
-  summaries run immedietly after the model checkpoint has been restored.
+  summaries run immediately after the model checkpoint has been restored.
 
   Note that `evaluate_once` creates a local variable used to track the number of
   evaluations run via `tf.contrib.training.get_or_create_eval_step`.
@@ -377,7 +379,7 @@ def evaluate_repeatedly(checkpoint_dir,
 
   Args:
     checkpoint_dir: The directory where checkpoints are stored.
-    master: The BNS address of the TensorFlow master.
+    master: The address of the TensorFlow master.
     scaffold: An tf.train.Scaffold instance for initializing variables and
       restoring variables. Note that `scaffold.init_fn` is used by the function
       to restore the checkpoint. If you supply a custom init_fn, then it must
@@ -453,7 +455,8 @@ def evaluate_repeatedly(checkpoint_dir,
           '%Y-%m-%d-%H:%M:%S', time.gmtime()))
     num_evaluations += 1
 
-    if max_number_of_evaluations is not None and num_evaluations >= max_number_of_evaluations:
+    if (max_number_of_evaluations is not None and
+        num_evaluations >= max_number_of_evaluations):
       return final_ops_hook.final_ops_values
 
   return final_ops_hook.final_ops_values
